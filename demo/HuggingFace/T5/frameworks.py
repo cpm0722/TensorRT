@@ -23,7 +23,7 @@ from typing import List, Union
 # huggingface
 from transformers import (
     T5ForConditionalGeneration,
-    T5Tokenizer,
+    AutoTokenizer,
     T5Config,
 )
 
@@ -157,7 +157,7 @@ class T5FHuggingFace(FrameworkCommand):
         metadata: NetworkMetadata,
         network_fpaths: NetworkModels,
     ):
-        tokenizer = T5Tokenizer.from_pretrained(metadata.variant)
+        tokenizer = AutoTokenizer.from_pretrained(metadata.variant)
 
         # By default, huggingface model structure is one giant file.
         t5_torch_fpath = network_fpaths.torch[0].fpath

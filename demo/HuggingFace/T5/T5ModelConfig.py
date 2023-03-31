@@ -240,11 +240,20 @@ class T5ModelTRTConfig(NNConfig):
                         Dims.create_new_sequence_dim("encoder_hidden_length"),
                         "encoder_hidden_size"
                     ),
+                    "encoder_attention_mask": (
+                        Dims.BATCH,
+                        Dims.create_new_sequence_dim("encoder_hidden_length"),
+                    ),
                 }
             )
             decoder_inputs = Dims(decoder_inputs_dict)
 
-        encoder_inputs = Dims(OrderedDict({"input_ids": (Dims.BATCH, Dims.SEQUENCE)}))
+        encoder_inputs = Dims(OrderedDict(
+            {
+                "input_ids": (Dims.BATCH, Dims.SEQUENCE),
+                "attention_mask": (Dims.BATCH, Dims.SEQUENCE),
+            }
+        ))
 
         return {
             T5ModelTRTConfig.NETWORK_DECODER_SEGMENT_NAME: decoder_inputs,
@@ -280,7 +289,11 @@ class T5ModelTRTConfig(NNConfig):
             decoder_outputs = [Dims(context_outputs_dict), Dims(decoder_outputs_dict)]
         else:
             decoder_outputs_dict = OrderedDict(
-                {"hidden_states": (Dims.BATCH, Dims.SEQUENCE)}
+                {"hidden_states": (
+                    Dims.BATCH,
+                    Dims.SEQUENCE,
+                    "encoder_hidden_size"
+                )}
             )
             decoder_outputs = Dims(decoder_outputs_dict)
         

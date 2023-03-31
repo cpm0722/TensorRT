@@ -37,11 +37,11 @@ import tensorrt as trt
 import torch
 
 # huggingface
-from transformers import T5Tokenizer, T5Config
+from transformers import AutoTokenizer, T5Config
 from transformers.modeling_outputs import Seq2SeqLMOutput
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation_utils import GenerationMixin
-from transformers.modeling_outputs import BaseModelOutput
+from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPastAndCrossAttentions
 
 # tensorrt
 from tensorrt import PreviewFeature
@@ -136,13 +136,15 @@ class T5TRTEncoder(TRTHFRunner):
         self.profile_idx = self.get_optimization_profile(batch_size=self.batch_size, sequence_length=1)
 
         self.input_shapes = {
-            "input_ids": (self.batch_size, self.max_sequence_length)
+            "input_ids": (self.batch_size, self.max_sequence_length),
+            "attention_mask": (self.batch_size, self.max_sequence_length),
         }
         self.input_types = {
-            "input_ids": torch.int32
+            "input_ids": torch.int32,
+            "attention_mask": torch.int32,
         }
         self.output_shapes = {
-            "hidden_states": (self.batch_size, self.max_sequence_length, self.encoder_hidden_size)
+            "hidden_states": (self.batch_size, self.max_sequence_length, self.encoder_hidden_size),
         }
         self.output_types = {
             "hidden_states": torch.float32
@@ -150,7 +152,7 @@ class T5TRTEncoder(TRTHFRunner):
 
         self.bindings = self._allocate_memory(self.input_shapes, self.input_types, self.output_shapes, self.output_types)
 
-    def forward(self, input_ids, *args, **kwargs):
+    def forward(self, input_ids, attention_mask, *args, **kwargs):
         bs = self.batch_size
         max_length = self.max_sequence_length
         TRTHFRunner.ENCODER_LENGTH = input_ids.shape[1]
@@ -167,11 +169,15 @@ class T5TRTEncoder(TRTHFRunner):
         if is_cpu_mode:
             self.inputs["input_ids"] = input_ids.int().flatten().contiguous().cuda()
             self.bindings[0] = self.inputs["input_ids"].data_ptr()
+            self.inputs["attention_mask"] = attention_mask.int().flatten().contiguous().cuda()
+            self.bindings[1] = self.inputs["attention_mask"].data_ptr()
         else:
             self.inputs["input_ids"][:bs * input_length] = input_ids.flatten()
+            self.inputs["attention_mask"][:bs * input_length] = attention_mask.flatten()
 
         # Set the binding shape of input_ids, which should be (bs, input_length).
         self.trt_context.set_binding_shape(0, input_ids.shape)
+        self.trt_context.set_binding_shape(1, attention_mask.shape)
 
         # Launch TRT inference.
         # TODO: Could we use execute_v2_async() instead of execute_v2()?
@@ -224,7 +230,7 @@ class T5TRTDecoder(TRTHFRunner):
 
         hidden_states_profile_length = self.max_output_length if not self.config.use_cache else 1
         # Construct buffer for hidden states outputs
-        self.hidden_states = torch.zeros((self.batch_size * num_beams, hidden_states_profile_length, hf_config.vocab_size), dtype = torch.float32).cuda()
+        self.hidden_states = torch.zeros((self.batch_size * num_beams, hidden_states_profile_length, hf_config.d_model), dtype = torch.float32).cuda()
         self.bindings[self.trt_engine.get_binding_index("hidden_states")] = self.hidden_states.data_ptr()
 
         if self.config.use_cache:
@@ -267,15 +273,19 @@ class T5TRTDecoder(TRTHFRunner):
         self.return_device = "cuda"
         self.variant = network_metadata.variant # record variant name to later index the vocab_size in forward()
     
-    def set_encoder_hidden_states_for_inference_cycle(self, encoder_hidden_states):
+    # def set_encoder_hidden_states_for_inference_cycle(self, encoder_hidden_states):
+    def set_encoder_hidden_states_for_inference_cycle(self, encoder_hidden_states, encoder_attention_mask):
         """Used to cache encoder hidden state runs across same encoder sessions"""
 
         if encoder_hidden_states.device == torch.device("cpu"):
             self.encoder_hidden_states = encoder_hidden_states.cuda()
+            self.encoder_attention_mask = encoder_attention_mask.cuda()
         else:
             self.encoder_hidden_states = encoder_hidden_states
+            self.encoder_attention_mask = encoder_attention_mask
         
         self.bindings[1] = self.encoder_hidden_states.data_ptr()
+        self.bindings[2] = self.encoder_attention_mask.data_ptr()
         self.persist_encoder_hidden_states = True
 
     def set_cross_attention_kv_cache_engine(self, cross_attention_kv_generator):
@@ -342,7 +352,8 @@ class T5TRTDecoder(TRTHFRunner):
             reordered_decoder_past = reordered_decoder_past + (reordered_layer_past_states,)
         return reordered_decoder_past
 
-    def forward(self, input_ids, encoder_hidden_states, *args, **kwargs):
+    # def forward(self, input_ids, encoder_hidden_states, *args, **kwargs):
+    def forward(self, input_ids, encoder_hidden_states, encoder_attention_mask, *args, **kwargs):
         # Get the batch size.
         bs = input_ids.shape[0] # in beam search mode, bs is batch_size * num_beams
 
@@ -363,9 +374,10 @@ class T5TRTDecoder(TRTHFRunner):
 
         # If encoder hidden states have not been copied yet, copy the hidden states to the input buffer.
         if not self.persist_encoder_hidden_states:
-            self.set_encoder_hidden_states_for_inference_cycle(encoder_hidden_states)
+            self.set_encoder_hidden_states_for_inference_cycle(encoder_hidden_states, encoder_attention_mask)
 
         self.trt_context.set_binding_shape(1, self.encoder_hidden_states.shape)
+        self.trt_context.set_binding_shape(2, self.encoder_attention_mask.shape)
 
         if self.config.use_cache:
             if (kwargs.get("past_key_values") is None):
@@ -409,7 +421,7 @@ class T5TRTDecoder(TRTHFRunner):
             self.past_decoder_length += 1
 
         # Transfer predictions back from GPU to do greedy search
-        return Seq2SeqLMOutput(logits=logits.to(self.return_device), past_key_values=present_key_values,)
+        return BaseModelOutputWithPastAndCrossAttentions(last_hidden_state=logits.to(self.return_device), past_key_values=present_key_values,)
 
     def prepare_inputs_for_generation(self, input_ids, past=None, use_cache=None, **kwargs):
         # In HuggingFace generation_utils.py, this function will be called at each decoding step, before running the decoder's forward().
@@ -516,7 +528,7 @@ class T5TRT(TRTInferenceCommand):
         benchmarking_args: T5TRTBenchmarkingArgs = None,
     ) -> Union[NetworkResult, BenchmarkingResult]:
 
-        tokenizer = T5Tokenizer.from_pretrained(metadata.variant)
+        tokenizer = AutoTokenizer.from_pretrained(metadata.variant)
         hf_config = self.t5_trt_decoder.config
         # Prepare the input tokens and find out output sequence length.
         if not benchmarking_mode:
@@ -618,7 +630,7 @@ class T5TRT(TRTInferenceCommand):
         encoder_input: str,
         decoder_input: str,
     ):
-        tokenizer = T5Tokenizer.from_pretrained(metadata.variant)
+        tokenizer = AutoTokenizer.from_pretrained(metadata.variant)
         encoder_input_ids = tokenizer([encoder_input], padding=True, return_tensors="pt").input_ids
         decoder_input_ids = tokenizer([decoder_input], padding=True, return_tensors="pt").input_ids
 
@@ -697,6 +709,11 @@ class T5TRT(TRTInferenceCommand):
                 min=(batch_size, 1),
                 opt=(batch_size, opt_input_seq_len),
                 max=(batch_size, max_input_length),
+            ).add(
+                "attention_mask",
+                min=(batch_size, 1),
+                opt=(batch_size, opt_input_seq_len),
+                max=(batch_size, max_input_length),
             )
         ]
 
@@ -725,8 +742,13 @@ class T5TRT(TRTInferenceCommand):
             min=(batch_size * num_beams, 1, encoder_hidden_size),
             opt=(batch_size * num_beams, opt_input_seq_len, encoder_hidden_size),
             max=(batch_size * num_beams, max_input_length, encoder_hidden_size),
+        ).add(
+            "encoder_attention_mask",
+            min=(batch_size * num_beams, 1),
+            opt=(batch_size * num_beams, opt_input_seq_len),
+            max=(batch_size * num_beams, max_input_length),
         )
-        
+
         if hf_config.use_cache:
 
             num_heads = hf_config.num_heads

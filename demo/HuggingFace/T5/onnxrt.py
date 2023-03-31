@@ -30,9 +30,9 @@ if __name__ == "__main__":
     sys.path.append(project_root)
 
 # huggingface
-from transformers import T5Tokenizer, T5Config, PretrainedConfig
+from transformers import AutoTokenizer, T5Config, PretrainedConfig
 from transformers.generation_utils import GenerationMixin
-from transformers.modeling_outputs import Seq2SeqLMOutput
+from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutputWithPastAndCrossAttentions
 
 # torch
 import torch
@@ -70,10 +70,11 @@ class OnnxHFRunner(PolygraphyOnnxRunner, GenerationMixin):
 class T5OnnxEncoder(OnnxHFRunner):
     """OnnxRT implemented network interface that is mainly to check correctness."""
 
-    def forward(self, input_ids, *args, **kwargs):
+    def forward(self, input_ids, attention_mask, *args, **kwargs):
         # Unoptimized unconditional transfer to numpy for interfacing with polygraphy
         input_ids = input_ids.cpu().numpy().astype("int64")
-        return torch.from_numpy(self.trt_context.infer({"input_ids": input_ids})["hidden_states"])
+        attention_mask = attention_mask.cpu().numpy().astype("int64")
+        return torch.from_numpy(self.trt_context.infer({"input_ids": input_ids, "attention_mask": attention_mask})["hidden_states"])
 
 class T5OnnxDecoder(OnnxHFRunner):
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
@@ -82,16 +83,21 @@ class T5OnnxDecoder(OnnxHFRunner):
             "encoder_hidden_states": kwargs["encoder_outputs"].last_hidden_state,
         }
 
-    def forward(self, input_ids, encoder_hidden_states, *args, **kwargs):
+    def forward(self, input_ids, encoder_hidden_states, encoder_attention_mask, *args, **kwargs):
         # Unoptimized unconditional transfer to numpy for interfacing with polygraphy
         input_ids = input_ids.cpu().numpy().astype("int64")
         encoder_hidden_states = encoder_hidden_states.cpu().numpy().astype("float32")
+        encoder_attention_mask = encoder_attention_mask.cpu().numpy().astype("int64")
 
-        logits = self.trt_context.infer(
-            {"input_ids": input_ids, "encoder_hidden_states": encoder_hidden_states}
+        hidden_states = self.trt_context.infer(
+            {
+                "input_ids": input_ids,
+                "encoder_hidden_states": encoder_hidden_states,
+                "encoder_attention_mask": encoder_attention_mask,
+             }
         )["hidden_states"]
 
-        return Seq2SeqLMOutput(logits=torch.from_numpy(logits))
+        return BaseModelOutputWithPastAndCrossAttentions(last_hidden_state=torch.from_numpy(hidden_states))
 
 class T5ONNXRT(OnnxRTCommand):
     def __init__(self):
@@ -130,7 +136,7 @@ class T5ONNXRT(OnnxRTCommand):
     ) -> NetworkResult:
 
         hf_config = T5Config.from_pretrained(metadata.variant)
-        tokenizer = T5Tokenizer.from_pretrained(metadata.variant)
+        tokenizer = AutoTokenizer.from_pretrained(metadata.variant)
         # Prepare the input tokens and find out output sequence length.
         if not benchmarking_mode:
             output_seq_len = T5ModelTRTConfig.MAX_SEQUENCE_LENGTH[metadata.variant]

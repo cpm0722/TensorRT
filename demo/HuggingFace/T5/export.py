@@ -187,6 +187,47 @@ class T5DecoderTorchFile(TorchModelFile):
                 past_key_values=past_key_values
             )
 
+        def forward_without_lm(
+            self,
+            input_ids,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            use_cache = None,
+            past_key_values = None,
+            return_dict = None,
+            **kwargs,
+        ):
+            # self.decoder is the HuggingFace t5 decoder
+            decoder_outputs = self.decoder(
+                input_ids=input_ids,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                use_cache=use_cache,
+                past_key_values=past_key_values,
+                return_dict=return_dict,
+                **kwargs
+            )
+
+            # self.config.d_model ** -0.5 for rescaling output on vocab.
+            # as seen in https://huggingface.co/docs/transformers/model_doc/t5#transformers.T5ForConditionalGeneration
+            last_hidden_state = decoder_outputs[0]
+            if use_cache:
+                if self.is_trt:
+                    past_key_values = ()
+                    past_key_values_output = decoder_outputs[1]
+                    for layer_past_states in past_key_values_output:
+                        past_key_values = past_key_values + (layer_past_states[:2],)
+                else:
+                    past_key_values = decoder_outputs[1]
+
+            if not return_dict:
+                return (last_hidden_state, past_key_values)
+
+            return BaseModelOutputWithPastAndCrossAttentions(
+                last_hidden_state=last_hidden_state,
+                past_key_values=past_key_values
+            )
+
     def __init__(self, model, network_metadata):
         super().__init__(model, T5DecoderConverter, network_metadata)
 
@@ -297,6 +338,7 @@ class T5DecoderConverter(ModelFileConverter):
         """
 
         input_ids = torch.tensor([[42] * 10])
+        attention_mask = torch.tensor([[1] * 8 + [0] * 2])
         # Exporting the decoder requires a basic instance of the encoder
         # Create one temporarily
         simplified_encoder = T5EncoderTorchFile.TorchModule(model.encoder)
@@ -318,15 +360,15 @@ class T5DecoderConverter(ModelFileConverter):
 
         if not network_metadata.other.kv_cache:
             # This code allows for huggingface compatible torch class to use onnx exporter
-            old_forward = decoder_with_lm_head.forward
-            def _export_forward(input_ids, encoder_hidden_states, **kwargs):
-                result = old_forward(input_ids, encoder_hidden_states, use_cache=False, **kwargs)
+            old_forward = decoder_with_lm_head.forward_without_lm
+            def _export_forward(input_ids, encoder_hidden_states, encoder_attention_mask, **kwargs):
+                result = old_forward(input_ids, encoder_hidden_states, encoder_attention_mask, use_cache=False, **kwargs)
                 return result[0]
             decoder_with_lm_head.forward = _export_forward
 
             torch.onnx.export(
                 decoder_with_lm_head,
-                (input_ids, simplified_encoder(input_ids)),
+                (input_ids, simplified_encoder(input_ids), attention_mask,),
                 output_fpath,
                 export_params=True,
                 opset_version=12,
@@ -436,6 +478,7 @@ class T5EncoderConverter(ModelFileConverter):
             Tuple[str]: Names of generated models
         """
         input_ids = torch.tensor([[42] * 10])
+        attention_mask = torch.tensor([[1] * 8 + [0] * 2])
         simplified_encoder = T5EncoderTorchFile.TorchModule(model.encoder)
         inputs = T5ModelTRTConfig.get_input_dims(network_metadata)["encoder"]
         outputs = T5ModelTRTConfig.get_output_dims(network_metadata)["encoder"]
@@ -449,7 +492,7 @@ class T5EncoderConverter(ModelFileConverter):
             opt_args['use_external_data_format'] = True
         torch.onnx._export(
             simplified_encoder,
-            input_ids,
+            (input_ids, attention_mask,),
             output_fpath,
             export_params=True,
             opset_version=12,
