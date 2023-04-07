@@ -7,61 +7,53 @@ from transformers import T5ForConditionalGeneration, AutoTokenizer, AutoConfig
 
 from NNDF.networks import NetworkMetadata, Precision
 from T5.T5ModelConfig import T5Metadata
-from T5.export import T5EncoderTRTEngine, T5DecoderTRTEngine
 
-# from T5.onnxrt import T5OnnxEncoder, T5OnnxDecoder
 from t5_wrapper import OnnxT5EncoderWrapperModule as T5OnnxEncoder
 from t5_wrapper import OnnxT5DecoderWrapperModule as T5OnnxDecoder
-
-# from T5.trt import T5TRTEncoder, T5TRTDecoder
 from t5_wrapper import TRTT5EncoderWrapperModule as T5TRTEncoder
 from t5_wrapper import TRTT5DecoderWrapperModule as T5TRTDecoder
-
 from t5_wrapper import T5ForConditionalGenerationWrapper
 
 
 device = torch.device("cuda:0")
 
-th_model_path = "T5/wd-t5-base/T5/t5-base/T5-base/pytorch_model"
-tokenizer_path = "t5-base"
+model_name = "t5-base"
+tokenizer_path = model_name
 
-onnx_encoder_file_path = "T5/wd-t5-base/T5/t5-base/T5-base/encoder/T5-base-encoder.onnx"
-onnx_decoder_file_path = "T5/wd-t5-base/T5/t5-base/T5-base/decoder/T5-base-decoder-with-lm-head.onnx"
+onnx_encoder_file_path = "./models/t5-base-encoder.onnx"
+onnx_decoder_file_path = "./models/t5-base-decoder.onnx"
 
-trt_encoder_file_path = "T5/wd-t5-base/T5/t5-base/T5-base/encoder/T5-base-encoder-bs1.engine"
-trt_decoder_file_path = "T5/wd-t5-base/T5/t5-base/T5-base/decoder/T5-base-decoder-with-lm-head-bs1.engine"
+trt_encoder_file_path = "./models/t5-base-encoder.engine"
+trt_decoder_file_path = "./models/t5-base-decoder.engine"
 
-metadata = NetworkMetadata(variant='t5-base', precision=Precision(fp16=False), other=T5Metadata(kv_cache=False))
+metadata = NetworkMetadata(variant=model_name,
+                           precision=Precision(fp16=False),
+                           other=T5Metadata(kv_cache=False),
+                           )
 
 # load Torch
-config = AutoConfig.from_pretrained(th_model_path)
+config = AutoConfig.from_pretrained(model_name)
 config.use_cache = False
 tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-th_model = T5ForConditionalGeneration.from_pretrained(th_model_path).eval().to(device)
+th_model = T5ForConditionalGeneration.from_pretrained(model_name).eval().to(device)
+if metadata.precision.fp16:
+    th_model = th_model.half()
 
-# load ONNX
-onnx_encoder = T5OnnxEncoder(onnx_encoder_file_path,
-                                    metadata,
-                                    config)
-onnx_decoder = T5OnnxDecoder(onnx_decoder_file_path,
-                                    metadata,
-                                    config)
-lm_head = copy.deepcopy(th_model.lm_head).to("cpu")
-onnx_model = T5ForConditionalGenerationWrapper(onnx_encoder, onnx_decoder, lm_head, config)
+# # load ONNX
+# onnx_encoder = T5OnnxEncoder(onnx_encoder_file_path, metadata, config)
+# onnx_decoder = T5OnnxDecoder(onnx_decoder_file_path, metadata, config)
+# lm_head = copy.deepcopy(th_model.lm_head).to("cpu")
+# onnx_model = T5ForConditionalGenerationWrapper(onnx_encoder, onnx_decoder, lm_head, config)
 
 # load TensorRT
-
-trt_encoder_engine = T5EncoderTRTEngine(trt_encoder_file_path, metadata)
-trt_decoder_engine = T5DecoderTRTEngine(trt_decoder_file_path, metadata)
-trt_encoder = T5TRTEncoder(trt_encoder_engine, metadata, config)
-trt_decoder = T5TRTDecoder(trt_decoder_engine, metadata, config)
+trt_encoder = T5TRTEncoder(trt_encoder_file_path, config, profile_idx=0, fp16=metadata.precision.fp16)
+trt_decoder = T5TRTDecoder(trt_decoder_file_path, config, profile_idx=0, fp16=metadata.precision.fp16)
 lm_head = copy.deepcopy(th_model.lm_head)
 trt_model = T5ForConditionalGenerationWrapper(trt_encoder, trt_decoder, lm_head, config)
 
 
 batch_size = 1
 input_text = "premise: If I fall asleep then I am going to wake up in 8 hours. hypothesis: I fell asleep but did not wake up in 8 hours."
-# input_text = "translate English to German: That is good."
 input = tokenizer([input_text] * batch_size,
                   padding='longest',
                   max_length=512,
@@ -71,8 +63,6 @@ input = tokenizer([input_text] * batch_size,
 input_ids = input.input_ids.to(device)
 attention_mask = input.attention_mask.to(device)
 
-# decoder_text = "Translated:"
-# dec_input_ids = tokenizer([decoder_text] * batch_size, padding=True, return_tensors="pt").input_ids.to(device)
 dec_input_ids = torch.ones((batch_size, 1), dtype=torch.long, device=device) * config.decoder_start_token_id
 
 
@@ -107,7 +97,7 @@ with torch.no_grad():
                               encoder_attention_mask=attention_mask,
                               )
     # print("trt_dec_out: {}, {}".format(type(trt_dec_out), trt_dec_out.last_hidden_state.shape))
-    trt_head_out = th_model.lm_head(copy.deepcopy(trt_dec_out.last_hidden_state) * config.d_model ** -0.5)
+    trt_head_out = trt_model.lm_head(trt_dec_out.last_hidden_state * config.d_model ** -0.5)
     # print("trt_head_out: {}, {}".format(type(trt_head_out), trt_head_out.shape))
     trt_out = trt_model.generate(input_ids,
                                  decoder_input_ids=dec_input_ids,
@@ -119,39 +109,39 @@ with torch.no_grad():
     print("[TRT  ] {}".format(trt_text[0]))
 
 
-    input_ids = input_ids.cpu()
-    attention_mask = attention_mask.cpu()
-    dec_input_ids = dec_input_ids.cpu()
-    onnx_enc_out = onnx_encoder(input_ids=input_ids,
-                                attention_mask=attention_mask,
-                                )
-    # print("onnx_enc_out: {}, {}".format(type(onnx_enc_out), onnx_enc_out.last_hidden_state.shape))
-    onnx_dec_out = onnx_decoder(input_ids=dec_input_ids,
-                                encoder_hidden_states=onnx_enc_out.last_hidden_state,
-                                encoder_attention_mask=attention_mask,
-                                )
-    # print("onnx_dec_out: {}, {}".format(type(onnx_dec_out), onnx_dec_out.last_hidden_state.shape))
-    onnx_head_out = onnx_model.lm_head(onnx_dec_out.last_hidden_state * config.d_model ** -0.5)
-    # print("onnx_head_out: {}, {}".format(type(onnx_head_out), onnx_head_out.shape))
-    onnx_out = onnx_model.generate(input_ids,
-                                   decoder_input_ids=dec_input_ids,
-                                   max_length=32,
-                                   min_length=1,
-                                   num_beams=1,
-                                   )
-    onnx_text = tokenizer.batch_decode(onnx_out)
-    print("[ONNX ] {}".format(onnx_text[0]))
+    # input_ids = input_ids.cpu()
+    # attention_mask = attention_mask.cpu()
+    # dec_input_ids = dec_input_ids.cpu()
+    # onnx_enc_out = onnx_encoder(input_ids=input_ids,
+    #                             attention_mask=attention_mask,
+    #                             )
+    # # print("onnx_enc_out: {}, {}".format(type(onnx_enc_out), onnx_enc_out.last_hidden_state.shape))
+    # onnx_dec_out = onnx_decoder(input_ids=dec_input_ids,
+    #                             encoder_hidden_states=onnx_enc_out.last_hidden_state,
+    #                             encoder_attention_mask=attention_mask,
+    #                             )
+    # # print("onnx_dec_out: {}, {}".format(type(onnx_dec_out), onnx_dec_out.last_hidden_state.shape))
+    # onnx_head_out = onnx_model.lm_head(onnx_dec_out.last_hidden_state * config.d_model ** -0.5)
+    # # print("onnx_head_out: {}, {}".format(type(onnx_head_out), onnx_head_out.shape))
+    # onnx_out = onnx_model.generate(input_ids,
+    #                                decoder_input_ids=dec_input_ids,
+    #                                max_length=32,
+    #                                min_length=1,
+    #                                num_beams=1,
+    #                                )
+    # onnx_text = tokenizer.batch_decode(onnx_out)
+    # print("[ONNX ] {}".format(onnx_text[0]))
 
-onnx_encoder.release()
-onnx_decoder.release()
+# onnx_encoder.release()
+# onnx_decoder.release()
 
 
 th_enc_result = th_enc_out.last_hidden_state.cpu()
 th_dec_result = th_dec_out.last_hidden_state.cpu()
 th_head_result = th_head_out.cpu()
-onnx_enc_result = onnx_enc_out.last_hidden_state.cpu()
-onnx_dec_result = onnx_dec_out.last_hidden_state.cpu()
-onnx_head_result = onnx_head_out.cpu()
+# onnx_enc_result = onnx_enc_out.last_hidden_state.cpu()
+# onnx_dec_result = onnx_dec_out.last_hidden_state.cpu()
+# onnx_head_result = onnx_head_out.cpu()
 trt_enc_result = trt_enc_out.last_hidden_state.cpu()
 trt_dec_result = trt_dec_out.last_hidden_state.cpu()
 trt_head_result = trt_head_out.cpu()
@@ -180,11 +170,11 @@ def print_diff(enc_diff, dec_diff, head_diff):
 
 
 print()
-print("Torch vs ONNX")
-enc_diff = abs(onnx_enc_result - th_enc_result)
-dec_diff = abs(onnx_dec_result - th_dec_result)
-head_diff = abs(onnx_head_result - th_head_result)
-print_diff(enc_diff, dec_diff, head_diff)
+# print("Torch vs ONNX")
+# enc_diff = abs(onnx_enc_result - th_enc_result)
+# dec_diff = abs(onnx_dec_result - th_dec_result)
+# head_diff = abs(onnx_head_result - th_head_result)
+# print_diff(enc_diff, dec_diff, head_diff)
 
 
 print("Torch vs TRT")
