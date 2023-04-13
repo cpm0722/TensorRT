@@ -81,7 +81,6 @@ class HostDeviceMem:
     def __init__(self, size: int, dtype: np.dtype):
         nbytes = size * dtype.itemsize
         host_mem = cuda_call(cudart.cudaMallocHost(nbytes))
-        print(type(dtype), dtype)
         pointer_type = ctypes.POINTER(np.ctypeslib.as_ctypes_type(dtype))
 
         self._host = np.ctypeslib.as_array(ctypes.cast(host_mem, pointer_type), (size,))
@@ -187,12 +186,18 @@ class TRTModel:
             if not shape_valid and profile_idx is None:
                 raise ValueError(f"Binding {binding} has dynamic shape, " +\
                     "but no profile was specified.")
+            size = trt.volume(shape)
+            if self.engine.has_implicit_batch_dimension:
+                size *= self.engine.max_batch_size
             dtype = np.dtype(trt.nptype(self.engine.get_tensor_dtype(binding)))
 
-            binding_memory = TorchDeviceMem(shape, dtype)
-            print(binding, shape, dtype)
+            # Allocate host and device buffers
+            binding_memory = HostDeviceMem(size, dtype)
+
+            # Append the device buffer to device bindings
             bindings.append(int(binding_memory.device))
 
+            # Append to the appropriate list
             if self.engine.get_tensor_mode(binding) == trt.TensorIOMode.INPUT:
                 inputs.append(binding_memory)
             else:
@@ -200,22 +205,76 @@ class TRTModel:
 
         return inputs, outputs, bindings
 
+    # Wrapper for cudaMemcpy which infers copy size and does error checking
+    def memcpy_host_to_device(device_ptr: int, host_arr: np.ndarray):
+        nbytes = host_arr.size * host_arr.itemsize
+        cuda_call(cudart.cudaMemcpy(device_ptr, host_arr, nbytes, cudart.cudaMemcpyKind.cudaMemcpyHostToDevice))
+
+
+    # Wrapper for cudaMemcpy which infers copy size and does error checking
+    def memcpy_device_to_host(host_arr: np.ndarray, device_ptr: int):
+        nbytes = host_arr.size * host_arr.itemsize
+        cuda_call(cudart.cudaMemcpy(host_arr, device_ptr, nbytes, cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost))
+
 
     def infer(self, data):
         for input_name in data:
-            itemsize = torch_to_numpy_dtype_dict[data[input_name].dtype].itemsize
-            nbytes = itemsize * trt.volume(data[input_name].shape)
-            cuda_call(cudart.cudaMemcpyAsync(self.inputs[self.engine[input_name]].device,
-                                             data[input_name].data_ptr(),
-                                             nbytes,
-                                             cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
-                                             self.stream,
-                                             ))
+            self.inputs[self.engine[input_name]].host = data[input_name].cpu().numpy()
             self.context.set_input_shape(input_name, data[input_name].shape)
 
+        [cuda_call(cudart.cudaMemcpyAsync(inp.device, inp.host, inp.nbytes, cudart.cudaMemcpyKind.cudaMemcpyHostToDevice, self.stream)) for inp in self.inputs]
         self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream)
+        [cuda_call(cudart.cudaMemcpyAsync(out.host, out.device, out.nbytes, cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost, self.stream)) for out in self.outputs]
+
         cuda_call(cudart.cudaStreamSynchronize(self.stream))
-        return [out.tensor for out in self.outputs]
+        return [out.host for out in self.outputs]
+
+
+    # def _allocate_buffer(self, profile_idx=None, output_shape=None):
+    #     inputs = []
+    #     outputs = []
+    #     bindings = []
+    #     tensor_names = [self.engine.get_tensor_name(i) for i in range(self.engine.num_io_tensors)]        
+    #     # Setup I/O bindings
+    #     for binding in tensor_names:
+    #         # Get input/output shape
+    #         if self.engine.get_tensor_mode(binding) == trt.TensorIOMode.INPUT:
+    #             shape = self.engine.get_tensor_shape(binding) if profile_idx is None else self.engine.get_tensor_profile_shape(binding, profile_idx)[-1]
+    #         else:
+    #             shape = trt.Dims(output_shape[binding])  # Change it according to max output length
+    #         shape_valid = np.all([s >= 0 for s in shape])
+    #         if not shape_valid and profile_idx is None:
+    #             raise ValueError(f"Binding {binding} has dynamic shape, " +\
+    #                 "but no profile was specified.")
+    #         dtype = np.dtype(trt.nptype(self.engine.get_tensor_dtype(binding)))
+    #
+    #         binding_memory = TorchDeviceMem(shape, dtype)
+    #         print(binding, shape, dtype)
+    #         bindings.append(int(binding_memory.device))
+    #
+    #         if self.engine.get_tensor_mode(binding) == trt.TensorIOMode.INPUT:
+    #             inputs.append(binding_memory)
+    #         else:
+    #             outputs.append(binding_memory)
+    #
+    #     return inputs, outputs, bindings
+    #
+    #
+    # def infer(self, data):
+    #     for input_name in data:
+    #         itemsize = torch_to_numpy_dtype_dict[data[input_name].dtype].itemsize
+    #         nbytes = itemsize * trt.volume(data[input_name].shape)
+    #         cuda_call(cudart.cudaMemcpyAsync(self.inputs[self.engine[input_name]].device,
+    #                                          data[input_name].data_ptr(),
+    #                                          nbytes,
+    #                                          cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+    #                                          self.stream,
+    #                                          ))
+    #         self.context.set_input_shape(input_name, data[input_name].shape)
+    #
+    #     self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream)
+    #     cuda_call(cudart.cudaStreamSynchronize(self.stream))
+    #     return [out.tensor for out in self.outputs]
 
 
 class T5TRTEncoder(TRTModel, nn.Module):
@@ -233,7 +292,8 @@ class T5TRTEncoder(TRTModel, nn.Module):
         self.batch_size = batch_size
 
     def infer(self, data):
-        return super().infer(data)
+        out = super().infer(data)
+        return [torch.from_numpy(array).reshape(shape).cuda() for array, shape in zip(out, self.output_shape.values())]
 
 
 class T5TRTDecoder(TRTModel, nn.Module):
@@ -251,4 +311,5 @@ class T5TRTDecoder(TRTModel, nn.Module):
         self.batch_size = batch_size
 
     def infer(self, data):
-        return super().infer(data)
+        out = super().infer(data)
+        return [torch.from_numpy(array).reshape(shape).cuda() for array, shape in zip(out, self.output_shape.values())]

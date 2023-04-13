@@ -23,8 +23,8 @@ tokenizer_path = model_name
 onnx_encoder_file_path = "./models/t5-base-encoder.onnx"
 onnx_decoder_file_path = "./models/t5-base-decoder.onnx"
 
-trt_encoder_file_path = "./models/t5-base-encoder.engine"
-trt_decoder_file_path = "./models/t5-base-decoder.engine"
+trt_encoder_file_path = "./models/t5-base-encoder-fp16.engine"
+trt_decoder_file_path = "./models/t5-base-decoder-fp16.engine"
 
 metadata = NetworkMetadata(variant=model_name,
                            precision=Precision(fp16=False),
